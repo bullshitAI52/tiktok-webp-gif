@@ -1,13 +1,15 @@
-"""TikTok 评论区动图提取 + WebP → GIF 转换核心模块
+"""TikTok 评论区动图提取 — 支持第三方 API + 代理 + Playwright 三种模式
 
-用法（在服务器上）:
-    pip install streamlit pillow requests yt-dlp
-    streamlit run app.py --server.port 8501
+配置方式（按优先级）:
+  1. TIKTOK_API_KEY=xxx       # SocialData.tools API Key（推荐，评论区数据来源）
+  2. TIKTOK_PROXY=socks5://... # 代理（绕过 IP 封锁）
+  3. TIKTOK_WORKER=url         # Cloudflare Worker 中转
 """
 
 import io
 import json
 import logging
+import os
 import re
 import subprocess
 import time
@@ -18,120 +20,66 @@ from PIL import Image
 logger = logging.getLogger(__name__)
 
 # ─── 常量 ───────────────────────────────────────────────
+WECHAT_MAX_BYTES = 4.5 * 1024 * 1024
+WECHAT_TARGET_BYTES = 1.5 * 1024 * 1024
+MOBILE_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148"
 
-WECHAT_MAX_BYTES = 4.5 * 1024 * 1024      # 微信自定义表情包上限 ≈ 4.5 MB
-WECHAT_TARGET_BYTES = 1.5 * 1024 * 1024   # 上传/发送最舒服的大小
+# ─── 配置（环境变量） ──────────────────────────────────
+TIKTOK_API_KEY = os.environ.get("TIKTOK_API_KEY", "")
+TIKTOK_PROXY = os.environ.get("TIKTOK_PROXY", "")
+TIKTOK_WORKER = os.environ.get("TIKTOK_WORKER", "")
 
-MOBILE_UA = (
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) "
-    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 "
-    "Mobile/15E148 Safari/604.1"
-)
-DESKTOP_UA = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 "
-    "Safari/537.36"
-)
 
-STICKER_DOMAINS = [
-    "p16-va-default", "p16-sign", "p16-va", "p26-va",
-    "~tplv", "dy-360p", "dy-480p",
-]
+def _proxies() -> dict:
+    if TIKTOK_PROXY:
+        return {"http": TIKTOK_PROXY, "https": TIKTOK_PROXY}
+    return {}
+
+def _headers(extra: dict = None) -> dict:
+    h = {"User-Agent": MOBILE_UA}
+    if extra:
+        h.update(extra)
+    return h
 
 
 # ─── 链接解析 ──────────────────────────────────────────
-
 def parse_video_id(url: str) -> str | None:
-    """从 TikTok 链接提取视频 ID。"""
     url = url.strip().split("?")[0]
-
-    # https://www.tiktok.com/@user/video/1234567890
-    m = re.search(r"/video/(\d+)", url)
-    if m:
-        return m.group(1)
-
-    # https://vm.tiktok.com/XXXXXX/
-    m = re.search(r"vm\.tiktok\.com/(\w+)", url)
-    if m:
-        return m.group(1)
-
-    # https://www.tiktok.com/t/ZTYxMjM0/
-    m = re.search(r"/t/(\w+)", url)
-    if m:
-        return m.group(1)
-
+    for pattern in [r"/video/(\d+)", r"vm\.tiktok\.com/(\w+)", r"/t/(\w+)"]:
+        m = re.search(pattern, url)
+        if m:
+            return m.group(1)
     return None
 
 
 def resolve_short_url(url: str) -> str:
-    """解析 vm.tiktok.com 短链。"""
     try:
-        r = requests.head(url, allow_redirects=True, timeout=10,
-                          headers={"User-Agent": MOBILE_UA})
+        r = requests.get(url, timeout=15, headers=_headers(),
+                         proxies=_proxies(), allow_redirects=True)
         return r.url
     except Exception:
         return url
 
 
-def make_session() -> requests.Session:
-    """创建带 ttwid cookie 的 Session。"""
-    sess = requests.Session()
-    sess.headers.update({
-        "User-Agent": DESKTOP_UA,
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        "Origin": "https://www.tiktok.com",
-        "Referer": "https://www.tiktok.com/",
-    })
-    # 先访问首页拿 cookie
-    try:
-        sess.get("https://www.tiktok.com/", timeout=20)
-    except Exception:
-        pass
-    return sess
+# ─── 模式 1: 第三方 API（SocialData.tools） ──────────
+SOCIALDATA_BASE = "https://api.socialdata.tools/tiktok"
 
-
-# ─── 视频元数据 ────────────────────────────────────────
-
-def get_video_meta(url: str) -> dict:
-    """通过 yt-dlp 获取视频元数据。返回 dict，包含 id / title 等。"""
-    cmd = ["yt-dlp", "--dump-json", "--no-download", "--quiet", url]
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        if r.returncode != 0:
-            raise RuntimeError(f"yt-dlp 解析失败 (err={r.returncode}): {r.stderr[:200]}")
-        return json.loads(r.stdout.strip().splitlines()[0])
-    except FileNotFoundError:
-        raise RuntimeError("请先在服务器安装 yt-dlp: pip install yt-dlp")
-
-
-# ─── 评论区贴纸抓取 ────────────────────────────────────
-
-def fetch_comment_stickers(
-    video_id: str,
-    max_count: int = 80,
-    max_pages: int = 3,
-) -> list[dict]:
-    """抓取评论区带动图贴纸的评论，返回 [{url, comment_text, author}, ...]。"""
+def _fetch_comments_via_api(video_id: str, max_count: int = 50) -> list[dict]:
+    """通过 SocialData.tools API 获取评论（含 sticker 数据）"""
     stickers: list[dict] = []
-    seen: set[str] = set()
-    sess = make_session()
+    seen_urls: set[str] = set()
     cursor = 0
-    n_pages = 0
 
-    while n_pages < max_pages:
-        params = {
-            "aweme_id": video_id,
-            "count": min(max_count, 50),
-            "cursor": cursor,
-        }
+    for page in range(3):
         try:
-            resp = sess.get(
-                "https://www.tiktok.com/api/comment/list/",
-                params=params, timeout=15,
+            resp = requests.get(
+                f"{SOCIALDATA_BASE}/video/{video_id}/comments",
+                params={"cursor": cursor, "count": min(max_count, 50)},
+                headers={"Authorization": f"Bearer {TIKTOK_API_KEY}"},
+                timeout=20,
             )
             if resp.status_code != 200:
-                logger.warning("评论 API 返回 %s，停止", resp.status_code)
+                logger.warning("API 返回 %s: %s", resp.status_code, resp.text[:200])
                 break
 
             data = resp.json()
@@ -141,23 +89,15 @@ def fetch_comment_stickers(
 
             for c in comments:
                 sticker = c.get("sticker_data") or {}
-                image_url = (
-                    sticker.get("image_url")
-                    or sticker.get("image")
-                    or c.get("sticker_url")
-                    or ""
-                )
+                image_url = sticker.get("image_url") or sticker.get("image") or c.get("sticker_url") or ""
                 if not image_url:
                     continue
-
-                # 只保留 .webp / .gif
                 clean = image_url.split("?")[0].split("#")[0]
                 if not clean.lower().endswith((".webp", ".gif")):
                     continue
-                if clean in seen:
+                if clean in seen_urls:
                     continue
-                seen.add(clean)
-
+                seen_urls.add(clean)
                 stickers.append({
                     "url": clean,
                     "comment_text": c.get("text", ""),
@@ -167,113 +107,169 @@ def fetch_comment_stickers(
             cursor = data.get("cursor", cursor + len(comments))
             if not data.get("has_more", False):
                 break
-            n_pages += 1
-            time.sleep(0.5)
 
         except Exception as e:
-            logger.warning("抓取评论异常: %s", e)
+            logger.warning("API 调用异常: %s", e)
             break
 
     return stickers
 
 
+# ─── 模式 2: Playwright + 代理（浏览器爬取） ─────────
+def _playwright_harvest(video_id: str) -> list[dict]:
+    """通过 Playwright + xvfb + 代理加载页面 → 提取 sticker"""
+    stickers: list[dict] = []
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        logger.warning("Playwright 未安装")
+        return stickers
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=False,
+            args=["--no-sandbox", "--disable-gpu"])
+        ctx = browser.new_context(
+            proxy={"server": TIKTOK_PROXY} if TIKTOK_PROXY else None,
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 720},
+        )
+        page = ctx.new_page()
+
+        try:
+            page.goto(f"https://www.tiktok.com/@x/video/{video_id}",
+                       wait_until="domcontentloaded", timeout=45000)
+            time.sleep(5)
+
+            # 截取 API 响应
+            api_responses = []
+            def capture(resp):
+                if "api/comment/list" in resp.url:
+                    api_responses.append(resp)
+            page.on("response", capture)
+
+            # 滚动触发评论加载
+            for _ in range(3):
+                page.evaluate("window.scrollBy(0, 500)")
+                time.sleep(2)
+            time.sleep(3)
+
+            # 从捕获的响应中提取
+            for resp in api_responses:
+                try:
+                    data = resp.json()
+                    for c in data.get("comments", []):
+                        sticker = c.get("sticker_data") or {}
+                        url = sticker.get("image_url") or ""
+                        if url:
+                            stickers.append({
+                                "url": url.split("?")[0],
+                                "comment_text": c.get("text", ""),
+                                "author": c.get("user", {}).get("nickname", ""),
+                            })
+                except Exception:
+                    pass
+
+            # 尝试直接从页面 HTML 提取
+            if not stickers:
+                html = page.content()
+                for m in re.finditer(r'data-e2e="comment-item".*?data-src="(https://[^"]+\.(webp|gif))"', html):
+                    stickers.append({"url": m.group(1), "comment_text": "", "author": ""})
+
+        except Exception as e:
+            logger.warning("Playwright 提取异常: %s", e)
+        finally:
+            browser.close()
+
+    return stickers
+
+
 # ─── WebP → GIF 转换 ───────────────────────────────────
-
-def convert_webp_to_gif(
-    image_data: bytes,
-    max_size: int = WECHAT_MAX_BYTES,
-) -> bytes:
-    """把 WebP 动图转成微信友好的 GIF（自动降采样控制体积）。"""
+def convert_webp_to_gif(image_data: bytes, max_size: int = WECHAT_MAX_BYTES) -> bytes:
     src = Image.open(io.BytesIO(image_data))
-    is_animated = getattr(src, "is_animated", False)
     n_frames = getattr(src, "n_frames", 1)
-
-    # ─ 逐帧读取 ─
-    frames: list[Image.Image] = []
-    durations: list[int] = []
+    frames, durations = [], []
     for i in range(n_frames):
         src.seek(i)
         frames.append(src.convert("RGBA"))
-        try:
-            dur = src.info.get("duration", 100)
-        except Exception:
-            dur = 100
-        durations.append(max(dur, 20))
+        durations.append(max(src.info.get("duration", 100), 20))
 
-    if not frames:
-        frames = [src.convert("RGBA")]
-        durations = [100]
-
-    # ─ 降采样到合理尺寸 ─
+    # 降采样
     MAX_DIM = 480
     resized = []
     for f in frames:
         w, h = f.size
         if max(w, h) > MAX_DIM:
             s = MAX_DIM / max(w, h)
-            f = f.resize((max(1, int(w * s)), max(1, int(h * s))), Image.LANCZOS)
+            f = f.resize((max(1, int(w*s)), max(1, int(h*s))), Image.LANCZOS)
         resized.append(f)
 
-    # ─ 如果体积仍超限，持续缩小 ─
+    # 压缩到 max_size 以内
     w, h = resized[0].size
-    for _attempt in range(6):
+    for _ in range(6):
         buf = io.BytesIO()
-        resized[0].save(
-            buf, format="GIF",
-            save_all=True,
-            append_images=resized[1:] if len(resized) > 1 else [],
-            loop=0, duration=durations, disposal=2,
-        )
+        resized[0].save(buf, format="GIF", save_all=True,
+                        append_images=resized[1:] if len(resized) > 1 else [],
+                        loop=0, duration=durations, disposal=2)
         if buf.tell() <= max_size:
             return buf.getvalue()
-        # 缩小 80%
-        w, h = max(32, int(w * 0.8)), max(32, int(h * 0.8))
+        w, h = max(32, int(w*0.8)), max(32, int(h*0.8))
         resized = [f.resize((w, h), Image.LANCZOS) for f in resized]
 
-    # ─ 最后尝试 ─
     buf = io.BytesIO()
-    resized[0].save(
-        buf, format="GIF",
-        save_all=True,
-        append_images=resized[1:] if len(resized) > 1 else [],
-        loop=0, duration=durations, disposal=1,
-    )
+    resized[0].save(buf, format="GIF", save_all=True,
+                    append_images=resized[1:] if len(resized) > 1 else [],
+                    loop=0, duration=durations, disposal=1)
     return buf.getvalue()
 
 
 # ─── 一站式入口 ────────────────────────────────────────
-
 def harvest(tiktok_url: str) -> list[dict]:
-    """输入 TikTok 链接 → 返回 [{url, gif_bytes, gif_size_kb, comment_text}, ...]。"""
-    # 短链解析
     if "vm.tiktok.com" in tiktok_url or "/t/" in tiktok_url:
         tiktok_url = resolve_short_url(tiktok_url)
 
     video_id = parse_video_id(tiktok_url)
     if not video_id:
-        raise ValueError("无法解析视频 ID，请检查链接格式")
+        raise ValueError("无法解析视频 ID")
 
-    # yt-dlp 确认
+    # 用 yt-dlp 获取准确的 aweme_id
     try:
-        meta = get_video_meta(tiktok_url)
-        actual_id = meta.get("id", video_id)
-    except Exception as e:
-        logger.warning("yt-dlp 失败，回退到正则 ID: %s", e)
+        meta = subprocess.run(
+            ["yt-dlp", "--dump-json", "--no-download", "--quiet", tiktok_url],
+            capture_output=True, text=True, timeout=60)
+        if meta.returncode == 0:
+            actual_id = json.loads(meta.stdout.strip().splitlines()[0]).get("id", video_id)
+        else:
+            actual_id = video_id
+    except Exception:
         actual_id = video_id
 
-    stickers = fetch_comment_stickers(actual_id)
+    # ── 模式选择 ──
+    stickers = []
+
+    # 模式 1: 第三方 API
+    if TIKTOK_API_KEY:
+        logger.info("Using SocialData.tools API")
+        stickers = _fetch_comments_via_api(actual_id)
+
+    # 模式 2: Playwright + 代理
+    elif TIKTOK_PROXY:
+        logger.info("Using Playwright + proxy")
+        stickers = _playwright_harvest(actual_id)
+
     if not stickers:
         raise ValueError(
-            "评论区没找到动图贴纸。可能原因："
-            "① 视频评论无人发贴纸；"
-            "② TikTok 风控触发（等几分钟再试）"
+            "评论区没找到动图贴纸。\n"
+            "可能原因：该视频评论无人发贴纸。\n"
+            "如需绕过 TikTok 风控，配置 TIKTOK_API_KEY 即可。"
         )
 
+    # 下载并转换
     results = []
+    sess = requests.Session()
+    sess.proxies.update(_proxies())
     for s in stickers:
         try:
-            resp = requests.get(s["url"], timeout=15,
-                                headers={"User-Agent": MOBILE_UA})
+            resp = sess.get(s["url"], timeout=15, headers=_headers())
             if resp.status_code != 200:
                 continue
             gif = convert_webp_to_gif(resp.content)
@@ -283,7 +279,7 @@ def harvest(tiktok_url: str) -> list[dict]:
                 "gif_size_kb": round(len(gif) / 1024, 1),
             })
         except Exception as e:
-            logger.warning("转换失败: %s | url: %s", e, s["url"][:60])
+            logger.warning("转换失败: %s", e)
             continue
 
     return results
